@@ -6,7 +6,14 @@ import { useState, useRef, useEffect } from 'react';
 import Link from "next/link";
 import Image from "next/image";
 import { ArrowLeft, Upload, FileText, Database, Settings, AlertCircle, Download, File, Eye, Play, Loader2, Lightbulb, Save, ChevronDown, ChevronRight } from "lucide-react";
-import { apiCall } from "@/lib/api-config";
+// API call utility function
+const apiCall = async (url: string, options: RequestInit = {}) => {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return response.json();
+};
 
 interface SelectedFile {
     file: File;
@@ -19,6 +26,10 @@ interface SelectedFile {
     ucPath?: string;
     isProcessing: boolean;
     processError?: string;
+    format?: string;
+    extension?: string;
+    handlerAvailable?: boolean;
+    redactionSupported?: boolean;
 }
 
 interface WarehouseConfig {
@@ -34,6 +45,35 @@ interface VolumePathConfig {
 interface DeltaTablePathConfig {
     delta_table_path: string;
     default_delta_table_path: string;
+}
+
+interface SupportedFormats {
+    supported_formats: string[];
+    upload_formats: string[];
+    export_formats: string[];
+    format_handlers_available: {
+        markdown: boolean;
+        excel: boolean;
+        powerpoint: boolean;
+        pdf: boolean;
+    };
+}
+
+interface ExportInfo {
+    success: boolean;
+    export_file_path: string;
+    download_filename: string;
+    export_format: string;
+    files_processed: number;
+}
+
+interface RedactedFile {
+    original_file: string;
+    redacted_file: string;
+    entities_count: number;
+    entities?: any;
+    status: string;
+    format: string;
 }
 
 export default function DocumentIntelligencePage() {
@@ -80,11 +120,22 @@ export default function DocumentIntelligencePage() {
     const [aiTestResult, setAiTestResult] = useState<{success: boolean, message: string} | null>(null);
     
     
-    // PDF redaction state
-    const [pdfRedactionLoading, setPdfRedactionLoading] = useState(false);
-    const [pdfRedactionError, setPdfRedactionError] = useState<string | null>(null);
-    const [pdfRedactionSuccess, setPdfRedactionSuccess] = useState(false);
-    const [redactedPdfFiles, setRedactedPdfFiles] = useState<any[]>([]);
+    // Multi-format redaction state (replaces PDF-only redaction)
+    const [documentRedactionLoading, setDocumentRedactionLoading] = useState(false);
+    const [documentRedactionError, setDocumentRedactionError] = useState<string | null>(null);
+    const [documentRedactionSuccess, setDocumentRedactionSuccess] = useState(false);
+    const [redactedFiles, setRedactedFiles] = useState<RedactedFile[]>([]);
+    
+    // Export functionality state
+    const [exportLoading, setExportLoading] = useState(false);
+    const [exportError, setExportError] = useState<string | null>(null);
+    const [exportSuccess, setExportSuccess] = useState(false);
+    const [exportInfo, setExportInfo] = useState<ExportInfo | null>(null);
+    const [selectedExportFormat, setSelectedExportFormat] = useState<string>('md');
+    
+    // Supported formats state
+    const [supportedFormats, setSupportedFormats] = useState<SupportedFormats | null>(null);
+    const [formatsLoading, setFormatsLoading] = useState(false);
 
     // Utility function to extract error message from various error types
     const getErrorMessage = (err: unknown): string => {
@@ -136,6 +187,19 @@ export default function DocumentIntelligencePage() {
         }
     };
 
+    // Load supported formats
+    const loadSupportedFormats = async () => {
+        setFormatsLoading(true);
+        try {
+            const formats = await apiCall("/api/supported-formats");
+            setSupportedFormats(formats);
+        } catch (err) {
+            console.warn('Failed to load supported formats:', err);
+        } finally {
+            setFormatsLoading(false);
+        }
+    };
+
     // Load configuration on component mount
     useEffect(() => {
         const loadConfigurations = async () => {
@@ -154,6 +218,9 @@ export default function DocumentIntelligencePage() {
                 const deltaTablePathConfig = await apiCall("/api/delta-table-path-config");
                 setDeltaTablePathConfig(deltaTablePathConfig);
                 setNewDeltaTablePath(deltaTablePathConfig.delta_table_path || '');
+                
+                // Load supported formats
+                await loadSupportedFormats();
             } catch (err) {
                 console.warn('Failed to load configurations:', err);
             }
@@ -299,10 +366,14 @@ export default function DocumentIntelligencePage() {
             let preview = "";
             let previewUrl = "";
             
-            if (file.type.startsWith('text/') || file.name.endsWith('.txt')) {
-                // Text file - read content
+            if (file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+                // Text/Markdown file - read content
                 const text = await file.file.text();
-                preview = text;
+                if (file.name.endsWith('.md')) {
+                    preview = `MARKDOWN:\n${text}`;
+                } else {
+                    preview = text;
+                }
             } else if (file.type === 'application/pdf') {
                 // PDF file - create blob URL for iframe preview
                 const blob = new Blob([file.file], { type: 'application/pdf' });
@@ -313,6 +384,12 @@ export default function DocumentIntelligencePage() {
                 const blob = new Blob([file.file], { type: file.type });
                 previewUrl = URL.createObjectURL(blob);
                 preview = "IMAGE_PREVIEW"; // Special marker for image preview
+            } else if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+                // Excel file - show file info
+                preview = `EXCEL_PREVIEW:\n\nFile: ${file.name}\nSize: ${formatFileSize(file.size)}\nType: Excel Spreadsheet\n\nThis Excel file contains spreadsheet data. Upload and process to view extracted content using AI document parsing.`;
+            } else if (file.name.endsWith('.pptx') || file.name.endsWith('.ppt')) {
+                // PowerPoint file - show file info
+                preview = `POWERPOINT_PREVIEW:\n\nFile: ${file.name}\nSize: ${formatFileSize(file.size)}\nType: PowerPoint Presentation\n\nThis PowerPoint file contains presentation slides. Upload and process to view extracted content using AI document parsing.`;
             } else {
                 // Other file types
                 preview = `[Document - ${formatFileSize(file.size)}]
@@ -338,13 +415,8 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
     const collapseAllPanels = () => {
         setIsFileUploadCollapsed(true);
         setIsSelectedFilesCollapsed(true);
-        setIsSummarizeCollapsed(true);
-        setIsLabelsCollapsed(true);
         setIsDocumentPreviewCollapsed(true);
-        setIsAiResultsCollapsed(true);
         setIsDeltaTableResultsCollapsed(true);
-        setIsExtractResultsCollapsed(true);
-        setIsMaskResultsCollapsed(true);
     };
 
     const handleProcessFile = async (fileIndex: number) => {
@@ -373,9 +445,18 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                 throw new Error("Failed to get UC path from upload response");
             }
 
-            // Update file with UC path
+            // Update file with UC path and format information from backend
+            const uploadedFileInfo = uploadResult.uploaded_files[0];
             setSelectedFiles(prev => prev.map((f, i) => 
-                i === fileIndex ? { ...f, isUploaded: true, ucPath } : f
+                i === fileIndex ? { 
+                    ...f, 
+                    isUploaded: true, 
+                    ucPath,
+                    format: uploadedFileInfo?.format,
+                    extension: uploadedFileInfo?.extension,
+                    handlerAvailable: uploadedFileInfo?.handler_available,
+                    redactionSupported: uploadedFileInfo?.redaction_supported
+                } : f
             ));
 
             // Upload complete - mark file as uploaded and not processing
@@ -506,78 +587,6 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
         }
     };
 
-    const OLD_handleWriteToDeltaTable_REMOVE = async () => {
-        // This is old code that should be removed
-        try {
-            const response = await apiCall("/api/write-to-delta-table", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    file_paths: filePaths,
-                    limit: 10
-                })
-            });
-            
-            if (response.success && response.data) {
-                setDeltaTableResults(response.data);
-                setShowDeltaTableResults(true);
-                console.log(`Successfully processed ${response.data.length} table entries`);
-            } else {
-                // If the operation reports failure but we can see the UI shows table data,
-                // try to query the table directly as a fallback
-                console.log("Write operation reported failure, but checking if table has data...");
-                try {
-                    const queryResponse = await apiCall("/api/query-delta-table", {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json"
-                        },
-                        body: JSON.stringify({
-                            file_paths: filePaths,
-                            limit: 10
-                        })
-                    });
-                    
-                    if (queryResponse.success && queryResponse.data && queryResponse.data.length > 0) {
-                        console.log(`Found ${queryResponse.data.length} table entries via fallback query`);
-                        setDeltaTableResults(queryResponse.data);
-                        setShowDeltaTableResults(true);
-                        // Clear error since we successfully recovered the data
-                        setDeltaTableError(null);
-                        // Log the warning to console instead of showing it as an error
-                        console.warn(`Write operation reported issues (${response.message}) but recovered ${queryResponse.data.length} existing table entries.`);
-                    } else {
-                        setDeltaTableError(response.message || "No data returned from operation");
-                        setDeltaTableResults([]);
-                    }
-                } catch (queryError) {
-                    console.error("Fallback query also failed:", queryError);
-                    setDeltaTableError(response.message || "No data returned from operation");
-                    setDeltaTableResults([]);
-                }
-            }
-            
-        } catch (error) {
-            console.error("Delta table write error:", error);
-            
-            // Handle timeout errors with user-friendly message
-            let errorMessage = error instanceof Error ? error.message : String(error);
-            if (errorMessage.includes('504') || errorMessage.includes('timeout') || errorMessage.includes('upstream request timeout')) {
-                errorMessage = "The operation is taking longer than expected. Large documents may need more time to process. Please be patient.";
-            } else if (errorMessage.includes('500') || errorMessage.includes('Internal Server Error')) {
-                errorMessage = "There was a server error processing your document. Please check your file and configuration, then try again.";
-            } else if (errorMessage.includes('network') || errorMessage.includes('fetch')) {
-                errorMessage = "Network error occurred. Please check your connection and try again.";
-            }
-            
-            setDeltaTableError(errorMessage);
-            setDeltaTableResults([]);
-        } finally {
-            setDeltaTableLoading(false);
-        }
-    };
 
     const queryDeltaTableResults = async () => {
         console.log("Querying delta table results for files:", processedSessionFiles);
@@ -592,7 +601,7 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
         setDeltaTableError(null);
 
         try {
-            const response = await apiCall("/api/query-delta-table", {
+            const result = await apiCall("/api/query-delta-table", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
@@ -603,12 +612,6 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                 })
             });
 
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.detail || "Delta table query failed");
-            }
-
-            const result = await response.json();
             console.log("Delta table query result:", result);
             
             if (result.success) {
@@ -638,54 +641,156 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
         }
     };
 
-
-    const handleRedactPDF = async () => {
+    // Export document functionality
+    const handleExportDocument = async () => {
         try {
-            setPdfRedactionError(null);
-            setPdfRedactionLoading(true);
-            setPdfRedactionSuccess(false);
+            setExportError(null);
+            setExportLoading(true);
+            setExportSuccess(false);
             
-            // Get all uploaded PDF files' paths
+            // Get all uploaded files' paths
             const uploadedFiles = selectedFiles.filter(file => file.isUploaded && file.ucPath);
-            const pdfFilePaths = uploadedFiles.filter(file => file.name.toLowerCase().endsWith('.pdf')).map(file => file.ucPath!);
+            const filePaths = uploadedFiles.map(file => file.ucPath!);
             
-            if (pdfFilePaths.length === 0) {
-                throw new Error("No uploaded PDF files found. Please upload PDF files first.");
+            if (filePaths.length === 0) {
+                throw new Error("No uploaded files found. Please upload files first.");
             }
             
             if (deltaTableResults.length === 0) {
                 throw new Error("No document data found. Please write to Delta Table first.");
             }
             
-            console.log("Redacting PDF files:", pdfFilePaths);
+            console.log("Exporting documents:", filePaths, "Format:", selectedExportFormat);
             
-            const result = await apiCall("/api/redact-pdf", {
+            const result = await apiCall("/api/export-document", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-                    file_paths: pdfFilePaths
+                    file_paths: filePaths,
+                    export_format: selectedExportFormat,
+                    output_filename: `exported_document.${selectedExportFormat}`
                 })
             });
 
-            console.log("PDF redaction result:", result);
+            console.log("Export result:", result);
             
-            if (result.success && result.redacted_files) {
-                setRedactedPdfFiles(result.redacted_files);
-                setPdfRedactionSuccess(true);
-                console.log(`Successfully redacted ${result.redacted_files.length} PDF files`);
+            if (result.success) {
+                setExportInfo(result);
+                setExportSuccess(true);
+                console.log(`Successfully exported to ${selectedExportFormat} format`);
             } else {
-                setPdfRedactionError(result.message || "No PDF files were redacted");
-                setRedactedPdfFiles([]);
+                setExportError(result.message || "Export failed");
             }
             
         } catch (error) {
-            console.error("PDF redaction error:", error);
-            setPdfRedactionError(error instanceof Error ? error.message : String(error));
-            setRedactedPdfFiles([]);
+            console.error("Export error:", error);
+            setExportError(error instanceof Error ? error.message : String(error));
         } finally {
-            setPdfRedactionLoading(false);
+            setExportLoading(false);
+        }
+    };
+
+    // Download exported file
+    const handleDownloadExported = async (filename: string) => {
+        try {
+            console.log(`Downloading exported file: ${filename}`);
+            
+            // Get the correct base URL for API calls
+            const getDownloadUrl = () => {
+                if (typeof window !== 'undefined') {
+                    // Check if running in Databricks environment
+                    if (window.location.hostname.includes('cloud.databricks.com')) {
+                        // Use same origin for downloads in Databricks
+                        return `${window.location.protocol}//${window.location.hostname}/api/download-exported/${encodeURIComponent(filename)}`;
+                    }
+                }
+                // For local development
+                return `/api/download-exported/${encodeURIComponent(filename)}`;
+            };
+            
+            const downloadUrl = getDownloadUrl();
+            console.log(`Download URL: ${downloadUrl}`);
+            
+            // Use fetch to get the file
+            const response = await fetch(downloadUrl);
+            
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => 'Unknown error');
+                throw new Error(`Download failed: ${response.status} ${response.statusText} - ${errorText}`);
+            }
+            
+            // Get the blob from the response
+            const blob = await response.blob();
+            
+            // Create a blob URL and download
+            const blobUrl = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = blobUrl;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            
+            // Clean up
+            document.body.removeChild(link);
+            window.URL.revokeObjectURL(blobUrl);
+            
+            console.log(`Download completed for ${filename}`);
+            
+        } catch (error) {
+            console.error("Export download error:", error);
+            alert(`Download failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    };
+
+    const handleRedactDocuments = async () => {
+        try {
+            setDocumentRedactionError(null);
+            setDocumentRedactionLoading(true);
+            setDocumentRedactionSuccess(false);
+            
+            // Get all uploaded files' paths that support redaction
+            const uploadedFiles = selectedFiles.filter(file => file.isUploaded && file.ucPath && file.redactionSupported);
+            const filePaths = uploadedFiles.map(file => file.ucPath!);
+            
+            if (filePaths.length === 0) {
+                throw new Error("No uploaded files with redaction support found. Please upload supported files first.");
+            }
+            
+            if (deltaTableResults.length === 0) {
+                throw new Error("No document data found. Please write to Delta Table first.");
+            }
+            
+            console.log("Redacting documents:", filePaths);
+            
+            const result = await apiCall("/api/redact-document", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    file_paths: filePaths
+                })
+            });
+
+            console.log("Document redaction result:", result);
+            
+            if (result.success && result.redacted_files) {
+                setRedactedFiles(result.redacted_files);
+                setDocumentRedactionSuccess(true);
+                console.log(`Successfully processed ${result.redacted_files.length} documents for redaction`);
+            } else {
+                setDocumentRedactionError(result.message || "No documents were redacted");
+                setRedactedFiles([]);
+            }
+            
+        } catch (error) {
+            console.error("Document redaction error:", error);
+            setDocumentRedactionError(error instanceof Error ? error.message : String(error));
+            setRedactedFiles([]);
+        } finally {
+            setDocumentRedactionLoading(false);
         }
     };
 
@@ -810,145 +915,6 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
         );
     };
 
-    const renderSummarizeResults = () => {
-        if (summarizeLoading) {
-            return (
-                <div className="flex items-center justify-center p-8">
-                    <Loader2 className="h-6 w-6 animate-spin mr-2" />
-                    <span>Generating summary...</span>
-                </div>
-            );
-        }
-
-        if (summarizeError) {
-            return (
-                <div className="bg-red-50 border border-red-200 rounded p-3">
-                    <div className="flex items-center mb-2">
-                        <AlertCircle className="h-4 w-4 text-red-500 mr-2" />
-                        <span className="font-medium text-red-700">Summarize Error</span>
-                    </div>
-                    <p className="text-red-700 text-sm">{summarizeError}</p>
-                </div>
-            );
-        }
-
-        if (!summarizeResults) {
-            return (
-                <div className="text-center py-8 text-gray-500">
-                    <Lightbulb className="mx-auto h-12 w-12 text-gray-300 mb-2" />
-                    <p>No summary yet.</p>
-                    <p className="text-sm">Click "Summarize" to generate a summary of the document.</p>
-                </div>
-            );
-        }
-
-        return (
-            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200 p-6">
-                <div className="flex items-start mb-4">
-                    <div className="bg-blue-100 rounded-full p-2 mr-3 flex-shrink-0">
-                        <Lightbulb className="h-5 w-5 text-blue-600" />
-                    </div>
-                    <div className="flex-1">
-                        <h3 className="text-lg font-semibold text-blue-800 mb-2">Document Summary</h3>
-                        <p className="text-gray-800 leading-relaxed">
-                            {summarizeResults}
-                        </p>
-                    </div>
-                </div>
-                
-                <div className="bg-blue-100 rounded-lg p-4 border-l-4 border-blue-500">
-                    <div className="flex items-center mb-2">
-                        <span className="text-blue-700 font-semibold text-sm">💡 Powered by Databricks AI Functions</span>
-                    </div>
-                    <p className="text-blue-700 text-sm">
-                        This summary was automatically generated using the{' '}
-                        <code className="bg-blue-200 px-1 rounded text-xs">ai_summarize(content, 200)</code>{' '}
-                        function. This demonstrates how you can extract key insights from documents at scale using simple SQL commands.
-                    </p>
-                </div>
-            </div>
-        );
-    };
-
-    const renderExtractResults = () => {
-        if (extractLoading) {
-            return (
-                <div className="flex items-center justify-center p-8">
-                    <Loader2 className="h-6 w-6 animate-spin mr-2" />
-                    <span>Extracting information using AI...</span>
-                </div>
-            );
-        }
-
-        if (extractError) {
-            return (
-                <div className="bg-red-50 border border-red-200 rounded p-3">
-                    <div className="flex items-center mb-2">
-                        <AlertCircle className="h-4 w-4 text-red-500 mr-2" />
-                        <span className="font-medium text-red-700">Extract Error</span>
-                    </div>
-                    <p className="text-red-700 text-sm">{extractError}</p>
-                </div>
-            );
-        }
-
-        if (!extractResults) {
-            return (
-                <div className="text-center py-8 text-gray-500">
-                    <FileText className="mx-auto h-12 w-12 text-gray-300 mb-2" />
-                    <p>No extract results yet.</p>
-                    <p className="text-sm">Add labels and click Extract to see results here.</p>
-                </div>
-            );
-        }
-
-        try {
-            const parsed = typeof extractResults === 'string' ? JSON.parse(extractResults) : extractResults;
-            
-            return (
-                <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg border border-green-200">
-                    <div className="p-6">
-                        <div className="flex items-center mb-4">
-                            <div className="bg-green-100 rounded-full p-2 mr-3">
-                                <FileText className="h-5 w-5 text-green-600" />
-                            </div>
-                            <h3 className="text-lg font-semibold text-green-800">Extracted Information</h3>
-                        </div>
-                        
-                        <div className="text-sm text-green-700 mb-4">
-                            Extracted using enhanced ai_extract() with {labels.length} custom labels
-                        </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {Object.entries(parsed).map(([key, value], index) => (
-                                <div key={index} className="bg-white p-4 rounded border border-green-100">
-                                    <div className="font-semibold text-sm text-green-700 mb-2 capitalize">
-                                        {key.replace(/_/g, ' ')}
-                                    </div>
-                                    <div className="text-sm text-gray-800">
-                                        {typeof value === 'string' ? value : JSON.stringify(value)}
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-
-                        <div className="mt-4 text-xs text-green-600 bg-green-50 rounded p-2">
-                            <strong>💡 Extraction Summary:</strong> Successfully extracted {Object.keys(parsed).length} data points 
-                            using AI functions. This demonstrates how custom labels can be used to extract specific information 
-                            from documents at scale.
-                        </div>
-                    </div>
-                </div>
-            );
-        } catch (e) {
-            return (
-                <div className="bg-gray-50 p-4 rounded text-xs">
-                    <h5 className="font-medium text-gray-600 mb-2">Raw Extract Result:</h5>
-                    <pre className="whitespace-pre-wrap text-xs overflow-x-auto">{JSON.stringify(extractResults, null, 2)}</pre>
-                </div>
-            );
-        }
-    };
 
     const formatFileSize = (bytes: number) => {
         if (bytes === 0) return '0 Bytes';
@@ -1385,7 +1351,7 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                                     multiple
                                     onChange={handleFileChange}
                                     className="hidden"
-                                    accept=".txt,.pdf,.doc,.docx,.csv,.json,.jpg,.jpeg,.png"
+                                    accept=".txt,.pdf,.doc,.docx,.csv,.json,.jpg,.jpeg,.png,.md,.xlsx,.xls,.pptx,.ppt"
                                 />
                                 <Button onClick={handleFileSelect} className="w-full text-sm">
                                     <Upload className="mr-2 h-4 w-4" />
@@ -1438,6 +1404,23 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                                                 <div className="text-xs text-gray-500">
                                                     {formatFileSize(file.size)} • {file.type}
                                                     {file.isUploaded && <span className="text-green-600 ml-2">✓ Uploaded</span>}
+                                                    {file.format && (
+                                                        <div className="mt-1 flex items-center gap-1">
+                                                            <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded text-xs font-medium">
+                                                                {file.format}
+                                                            </span>
+                                                            {file.redactionSupported && (
+                                                                <span className="bg-green-100 text-green-700 px-1.5 py-0.5 rounded text-xs">
+                                                                    Redaction Support
+                                                                </span>
+                                                            )}
+                                                            {!file.handlerAvailable && (
+                                                                <span className="bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded text-xs">
+                                                                    Limited Support
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>
@@ -1600,74 +1583,182 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                         </Card>
                     )}
 
+                    {/* Export Document Panel - Shows when Delta table results exist */}
+                    {deltaTableResults.length > 0 && showDeltaTableResults && (
+                        <Card className="h-fit bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200">
+                            <CardHeader className="pb-3">
+                                <CardTitle className="flex items-center justify-between">
+                                    <div className="flex items-center">
+                                        <Download className="mr-2 h-5 w-5 text-purple-600" />
+                                        Export Documents
+                                    </div>
+                                </CardTitle>
+                                <CardDescription className="text-sm">
+                                    Export processed document content to various formats (Markdown, Excel, PowerPoint).
+                                </CardDescription>
+                            </CardHeader>
+                            <CardContent className="space-y-3 pt-0">
+                                {/* Export Format Selection */}
+                                <div className="p-3 bg-white rounded border">
+                                    <div className="text-sm font-medium text-gray-700 mb-2">Export Format</div>
+                                    <div className="flex gap-2">
+                                        {supportedFormats?.export_formats.map((format) => (
+                                            <button
+                                                key={format}
+                                                onClick={() => setSelectedExportFormat(format)}
+                                                className={`px-3 py-2 rounded text-xs font-medium transition-colors ${
+                                                    selectedExportFormat === format
+                                                        ? 'bg-purple-600 text-white'
+                                                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                                                }`}
+                                            >
+                                                .{format.toLowerCase()}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    {supportedFormats && (
+                                        <div className="text-xs text-gray-500 mt-2">
+                                            Format support: {Object.entries(supportedFormats.format_handlers_available)
+                                                .filter(([_, available]) => available)
+                                                .map(([format, _]) => format)
+                                                .join(', ')}
+                                        </div>
+                                    )}
+                                </div>
 
-                    {/* Redact PDF File Panel - Shows when Delta table results exist and PDF files uploaded */}
-                    {deltaTableResults.length > 0 && showDeltaTableResults && selectedFiles.some(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')) && (
+                                <Button
+                                    onClick={handleExportDocument}
+                                    disabled={exportLoading || deltaTableResults.length === 0}
+                                    className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400"
+                                    size="lg"
+                                >
+                                    {exportLoading ? (
+                                        <>
+                                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                            Exporting to {selectedExportFormat.toUpperCase()}...
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Download className="h-4 w-4 mr-2" />
+                                            Export to {selectedExportFormat.toUpperCase()}
+                                        </>
+                                    )}
+                                </Button>
+
+                                {exportError && (
+                                    <div className="text-xs text-red-600 bg-red-50 p-2 rounded">
+                                        {exportError}
+                                    </div>
+                                )}
+
+                                {exportSuccess && exportInfo && (
+                                    <div className="space-y-2">
+                                        <div className="text-xs text-green-600 bg-green-50 p-2 rounded">
+                                            ✓ Successfully exported {exportInfo.files_processed} document(s) to {exportInfo.export_format.toUpperCase()} format
+                                        </div>
+                                        <div className="bg-white p-2 rounded border">
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex-1">
+                                                    <div className="font-medium text-sm text-gray-800">
+                                                        {exportInfo.download_filename}
+                                                    </div>
+                                                    <div className="text-xs text-gray-600">
+                                                        Format: {exportInfo.export_format.toUpperCase()} • Files processed: {exportInfo.files_processed}
+                                                    </div>
+                                                </div>
+                                                <Button
+                                                    onClick={() => handleDownloadExported(exportInfo.download_filename)}
+                                                    size="sm"
+                                                    className="ml-2 bg-purple-600 hover:bg-purple-700 text-white px-2 py-1 h-6 text-xs"
+                                                >
+                                                    <Download className="h-3 w-3 mr-1" />
+                                                    Download
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </CardContent>
+                        </Card>
+                    )}
+
+                    {/* Redact Documents Panel - Shows when Delta table results exist and supported files uploaded */}
+                    {deltaTableResults.length > 0 && showDeltaTableResults && selectedFiles.some(f => f.isUploaded && f.redactionSupported) && (
                         <Card className="h-fit bg-gradient-to-r from-red-50 to-pink-50 border-red-200">
                             <CardHeader className="pb-3">
                                 <CardTitle className="flex items-center justify-between">
                                     <div className="flex items-center">
                                         <FileText className="mr-2 h-5 w-5 text-red-600" />
-                                        Redact PDF Files
+                                        Redact Documents
                                     </div>
                                 </CardTitle>
                                 <CardDescription className="text-sm">
-                                    Use AI-powered Named Entity Recognition to identify and redact sensitive information in PDF documents.
+                                    Use AI-powered Named Entity Recognition to identify and redact sensitive information across multiple document formats.
                                 </CardDescription>
                             </CardHeader>
                             <CardContent className="space-y-3 pt-0">
-                                {selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).length > 0 && (
+                                {selectedFiles.filter(f => f.isUploaded && f.redactionSupported).length > 0 && (
                                     <div className="p-3 bg-white rounded border">
                                         <div className="text-sm font-medium text-gray-700 mb-2">
-                                            Ready to Redact: {selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).length} PDF file(s)
+                                            Ready to Redact: {selectedFiles.filter(f => f.isUploaded && f.redactionSupported).length} file(s)
                                         </div>
                                         <div className="text-xs text-gray-600 space-y-1">
-                                            {selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).slice(0, 3).map((file, i) => (
-                                                <div key={i} className="font-mono">redacted_{file.name}</div>
+                                            {selectedFiles.filter(f => f.isUploaded && f.redactionSupported).slice(0, 3).map((file, i) => (
+                                                <div key={i} className="flex items-center gap-2">
+                                                    <span className="font-mono">redacted_{file.name}</span>
+                                                    <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded text-xs">
+                                                        {file.format || 'unknown'}
+                                                    </span>
+                                                </div>
                                             ))}
-                                            {selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).length > 3 && (
-                                                <div className="text-gray-500">+ {selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).length - 3} more files</div>
+                                            {selectedFiles.filter(f => f.isUploaded && f.redactionSupported).length > 3 && (
+                                                <div className="text-gray-500">+ {selectedFiles.filter(f => f.isUploaded && f.redactionSupported).length - 3} more files</div>
                                             )}
                                         </div>
                                     </div>
                                 )}
 
                                 <Button
-                                    onClick={handleRedactPDF}
-                                    disabled={pdfRedactionLoading || deltaTableResults.length === 0 || selectedFiles.filter(f => f.isUploaded && f.name.toLowerCase().endsWith('.pdf')).length === 0}
+                                    onClick={handleRedactDocuments}
+                                    disabled={documentRedactionLoading || deltaTableResults.length === 0 || selectedFiles.filter(f => f.isUploaded && f.redactionSupported).length === 0}
                                     className="w-full bg-red-600 hover:bg-red-700 disabled:bg-gray-400"
                                     size="lg"
                                 >
-                                    {pdfRedactionLoading ? (
+                                    {documentRedactionLoading ? (
                                         <>
                                             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                            Redacting PDF Files...
+                                            Redacting Documents...
                                         </>
                                     ) : (
                                         <>
                                             <FileText className="h-4 w-4 mr-2" />
-                                            Redact PDF Files
+                                            Redact Documents
                                         </>
                                     )}
                                 </Button>
 
-                                {pdfRedactionError && (
+                                {documentRedactionError && (
                                     <div className="text-xs text-red-600 bg-red-50 p-2 rounded">
-                                        {pdfRedactionError}
+                                        {documentRedactionError}
                                     </div>
                                 )}
 
-                                {pdfRedactionSuccess && redactedPdfFiles.length > 0 && (
+                                {documentRedactionSuccess && redactedFiles.length > 0 && (
                                     <div className="space-y-2">
                                         <div className="text-xs text-green-600 bg-green-50 p-2 rounded">
-                                            ✓ Successfully redacted {redactedPdfFiles.length} PDF file(s)
+                                            ✓ Successfully processed {redactedFiles.length} document(s) for redaction
                                         </div>
                                         <div className="space-y-1">
-                                            {redactedPdfFiles.map((file, index) => (
+                                            {redactedFiles.map((file, index) => (
                                                 <div key={index} className="text-xs bg-white p-2 rounded border">
                                                     <div className="flex items-center justify-between">
                                                         <div className="flex-1">
-                                                            <div className="font-medium text-gray-800">{file.redacted_file.split('/').pop()}</div>
+                                                            <div className="flex items-center gap-2 mb-1">
+                                                                <div className="font-medium text-gray-800">{file.redacted_file.split('/').pop()}</div>
+                                                                <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded text-xs">
+                                                                    {file.format}
+                                                                </span>
+                                                            </div>
                                                             <div className="text-gray-600">
                                                                 {file.entities_count} entities redacted • {file.status}
                                                             </div>
@@ -1678,14 +1769,16 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                                                                 </div>
                                                             )}
                                                         </div>
-                                                        <Button
-                                                            onClick={() => handleDownloadRedactedPDF(file.redacted_file, file.redacted_file.split('/').pop() || 'redacted.pdf')}
-                                                            size="sm"
-                                                            className="ml-2 bg-red-600 hover:bg-red-700 text-white px-2 py-1 h-6 text-xs"
-                                                        >
-                                                            <Download className="h-3 w-3 mr-1" />
-                                                            Download
-                                                        </Button>
+                                                        {file.status === 'redacted' && (
+                                                            <Button
+                                                                onClick={() => handleDownloadRedactedPDF(file.redacted_file, file.redacted_file.split('/').pop() || 'redacted_file')}
+                                                                size="sm"
+                                                                className="ml-2 bg-red-600 hover:bg-red-700 text-white px-2 py-1 h-6 text-xs"
+                                                            >
+                                                                <Download className="h-3 w-3 mr-1" />
+                                                                Download
+                                                            </Button>
+                                                        )}
                                                     </div>
                                                 </div>
                                             ))}
@@ -1736,6 +1829,39 @@ Click the "Process" button to upload this file to UC Volume and extract its cont
                                                     alt={`Preview of ${activeFile.name}`}
                                                     className="max-w-full max-h-full object-contain"
                                                 />
+                                            </div>
+                                        ) : activeFile.preview.startsWith('MARKDOWN:') ? (
+                                            <div className="bg-gray-50 p-4 rounded border h-full overflow-y-auto">
+                                                <div className="flex items-center gap-2 mb-3 pb-2 border-b">
+                                                    <FileText className="h-4 w-4 text-blue-600" />
+                                                    <span className="font-medium text-blue-600">Markdown File</span>
+                                                    <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs">
+                                                        {activeFile.format || 'markdown'}
+                                                    </span>
+                                                </div>
+                                                <pre className="text-sm whitespace-pre-wrap font-mono">{activeFile.preview.replace('MARKDOWN:\n', '')}</pre>
+                                            </div>
+                                        ) : activeFile.preview.startsWith('EXCEL_PREVIEW:') ? (
+                                            <div className="bg-green-50 p-4 rounded border h-full overflow-y-auto">
+                                                <div className="flex items-center gap-2 mb-3 pb-2 border-b">
+                                                    <Database className="h-4 w-4 text-green-600" />
+                                                    <span className="font-medium text-green-600">Excel Spreadsheet</span>
+                                                    <span className="bg-green-100 text-green-700 px-2 py-1 rounded text-xs">
+                                                        {activeFile.format || 'excel'}
+                                                    </span>
+                                                </div>
+                                                <pre className="text-sm whitespace-pre-wrap">{activeFile.preview.replace('EXCEL_PREVIEW:\n', '')}</pre>
+                                            </div>
+                                        ) : activeFile.preview.startsWith('POWERPOINT_PREVIEW:') ? (
+                                            <div className="bg-purple-50 p-4 rounded border h-full overflow-y-auto">
+                                                <div className="flex items-center gap-2 mb-3 pb-2 border-b">
+                                                    <FileText className="h-4 w-4 text-purple-600" />
+                                                    <span className="font-medium text-purple-600">PowerPoint Presentation</span>
+                                                    <span className="bg-purple-100 text-purple-700 px-2 py-1 rounded text-xs">
+                                                        {activeFile.format || 'powerpoint'}
+                                                    </span>
+                                                </div>
+                                                <pre className="text-sm whitespace-pre-wrap">{activeFile.preview.replace('POWERPOINT_PREVIEW:\n', '')}</pre>
                                             </div>
                                         ) : (
                                             <div className="bg-gray-50 p-4 rounded border h-full overflow-y-auto">

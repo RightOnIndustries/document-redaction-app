@@ -4,11 +4,11 @@ A full-stack application demonstrating AI Functions for document redaction, buil
 
 ## Features
 
-- **Document Upload**: Upload PDFs to Unity Catalog volumes
+- **Document Upload**: Upload PDFs, Markdown (.md), Excel (.xlsx), and PowerPoint (.ppt/.pptx) files to Unity Catalog volumes
 - **AI-Powered Parsing**: Extract tables from documents using Databricks AI Functions: `ai_parse_document()`
 - **Data Storage**: Store processed data in Delta tables
-- **PDF Document Redaction**: Perform name entity redaction using AI Query and redaction using pymupdf
-- **PDF Export**: Generate Excel files from extracted table data
+- **Multi-Format Document Redaction**: Perform name entity redaction using AI Query across PDF, Markdown, Excel, and PowerPoint formats
+- **Multi-Format Export**: Generate Markdown (.md), Excel (.xlsx), and PowerPoint (.ppt/.pptx) files from extracted document data
 
 ## Architecture
 

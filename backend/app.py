@@ -9,13 +9,44 @@ from databricks.sdk.service.sql import StatementState
 import os
 import yaml
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Dict, Any, Optional
 import tempfile
 import shutil
 import json
 import fitz
 import io
 import atexit
+import re
+from abc import ABC, abstractmethod
+import mimetypes
+
+# New imports for format support
+try:
+    import openpyxl
+    import xlsxwriter
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    EXCEL_SUPPORT = True
+except ImportError:
+    EXCEL_SUPPORT = False
+    print("Excel support not available - install openpyxl and xlsxwriter")
+
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.enum.text import PP_ALIGN
+    POWERPOINT_SUPPORT = True
+except ImportError:
+    POWERPOINT_SUPPORT = False
+    print("PowerPoint support not available - install python-pptx")
+
+try:
+    import markdown
+    import mistune
+    MARKDOWN_SUPPORT = True
+except ImportError:
+    MARKDOWN_SUPPORT = False
+    print("Markdown support not available - install markdown and mistune")
 
 def load_yaml_config():
     """Load configuration from app.yaml file"""
@@ -34,6 +65,63 @@ def load_yaml_config():
 
 # Load YAML configuration
 YAML_CONFIG = load_yaml_config()
+
+# Utility functions for format detection and handling
+def get_file_extension(filename: str) -> str:
+    """Get file extension from filename"""
+    return os.path.splitext(filename.lower())[1]
+
+def detect_file_format(file_path: str) -> str:
+    """Detect file format from path and return format type"""
+    ext = get_file_extension(file_path)
+    
+    format_mapping = {
+        '.md': 'markdown',
+        '.markdown': 'markdown',
+        '.xlsx': 'excel',
+        '.xls': 'excel',
+        '.pptx': 'powerpoint',
+        '.ppt': 'powerpoint',
+        '.pdf': 'pdf',
+        '.txt': 'text',
+        '.doc': 'word',
+        '.docx': 'word',
+        '.csv': 'csv',
+        '.json': 'json'
+    }
+    
+    return format_mapping.get(ext, 'unknown')
+
+def validate_file_format(filename: str, supported_formats: list) -> bool:
+    """Validate if file format is supported"""
+    ext = get_file_extension(filename)
+    return ext in supported_formats
+
+def generate_output_filename(original_path: str, suffix: str, new_extension: str = None) -> str:
+    """Generate output filename with suffix"""
+    base_path = os.path.dirname(original_path)
+    filename = os.path.splitext(os.path.basename(original_path))[0]
+    ext = new_extension or os.path.splitext(original_path)[1]
+    return os.path.join(base_path, f"{filename}_{suffix}{ext}").replace('\\', '/')
+
+def get_mime_type(file_extension: str) -> str:
+    """Get MIME type for file extension"""
+    mime_mapping = {
+        '.pdf': 'application/pdf',
+        '.md': 'text/markdown',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.xls': 'application/vnd.ms-excel',
+        '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        '.ppt': 'application/vnd.ms-powerpoint',
+        '.txt': 'text/plain',
+        '.json': 'application/json',
+        '.csv': 'text/csv'
+    }
+    return mime_mapping.get(file_extension.lower(), 'application/octet-stream')
+
+# Supported formats configuration
+SUPPORTED_UPLOAD_FORMATS = ['.pdf', '.md', '.xlsx', '.xls', '.pptx', '.ppt', '.txt', '.doc', '.docx', '.csv', '.json']
+SUPPORTED_EXPORT_FORMATS = ['md', 'xlsx', 'pptx', 'pdf']
 
 load_dotenv()
 
@@ -86,6 +174,517 @@ current_warehouse_id = warehouse_id
 current_volume_path = os.getenv("DATABRICKS_VOLUME_PATH", YAML_CONFIG.get("DATABRICKS_VOLUME_PATH"))
 current_delta_table_path = os.getenv("DATABRICKS_DELTA_TABLE_PATH", YAML_CONFIG.get("DATABRICKS_DELTA_TABLE_PATH"))
 
+# Base format handler class
+class BaseFormatHandler(ABC):
+    @abstractmethod
+    def can_handle(self, file_path: str, mime_type: str = None) -> bool:
+        """Check if handler can process this file type"""
+        pass
+    
+    @abstractmethod
+    def extract_content(self, file_path: str) -> str:
+        """Extract text content from file"""
+        pass
+    
+    @abstractmethod
+    def redact_content(self, file_path: str, replacements: Dict[str, str]) -> str:
+        """Redact content and return new file path"""
+        pass
+    
+    @abstractmethod
+    def get_supported_extensions(self) -> List[str]:
+        """Return list of supported file extensions"""
+        pass
+
+# Markdown handler implementation
+class MarkdownHandler(BaseFormatHandler):
+    def can_handle(self, file_path: str, mime_type: str = None) -> bool:
+        return (file_path.lower().endswith(('.md', '.markdown')) or 
+                mime_type == 'text/markdown') and MARKDOWN_SUPPORT
+    
+    def extract_content(self, file_path: str) -> str:
+        """Extract text content from Markdown file"""
+        if not w:
+            raise Exception("Databricks connection not configured")
+        
+        try:
+            # Download file from UC Volume
+            file_response = w.files.download(file_path=file_path)
+            
+            # Read content
+            if hasattr(file_response, 'content'):
+                content = file_response.content.decode('utf-8')
+            elif hasattr(file_response, 'read'):
+                content = file_response.read().decode('utf-8')
+            else:
+                content = str(file_response)
+            
+            return content
+        except Exception as e:
+            print(f"Error extracting Markdown content: {e}")
+            return ""
+    
+    def redact_content(self, file_path: str, replacements: Dict[str, str]) -> str:
+        """Redact Markdown content using text replacement"""
+        if not replacements:
+            return file_path
+        
+        try:
+            # Download original file
+            content = self.extract_content(file_path)
+            
+            # Perform text replacements
+            redacted_content = content
+            for search_text, replace_text in replacements.items():
+                redacted_content = re.sub(re.escape(search_text), replace_text, redacted_content, flags=re.IGNORECASE)
+            
+            # Generate redacted filename
+            redacted_path = generate_output_filename(file_path, "redacted", ".md")
+            
+            # Upload redacted content back to UC Volume
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, suffix='.md') as temp_file:
+                temp_file.write(redacted_content)
+                temp_file_path = temp_file.name
+            
+            try:
+                with open(temp_file_path, 'rb') as f:
+                    w.files.upload(
+                        file_path=redacted_path,
+                        contents=f,
+                        overwrite=True
+                    )
+            finally:
+                os.unlink(temp_file_path)
+            
+            return redacted_path
+        except Exception as e:
+            print(f"Error redacting Markdown content: {e}")
+            raise e
+    
+    def get_supported_extensions(self) -> List[str]:
+        return ['.md', '.markdown']
+
+# Excel handler implementation
+class ExcelHandler(BaseFormatHandler):
+    def can_handle(self, file_path: str, mime_type: str = None) -> bool:
+        return (file_path.lower().endswith(('.xlsx', '.xls')) or 
+                mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']) and EXCEL_SUPPORT
+    
+    def extract_content(self, file_path: str) -> str:
+        """Extract text content from Excel sheets"""
+        if not w:
+            raise Exception("Databricks connection not configured")
+        
+        try:
+            # Download file from UC Volume
+            file_response = w.files.download(file_path=file_path)
+            
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_file:
+                if hasattr(file_response, 'content'):
+                    temp_file.write(file_response.content)
+                elif hasattr(file_response, 'read'):
+                    temp_file.write(file_response.read())
+                else:
+                    temp_file.write(file_response)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Read Excel file
+                workbook = openpyxl.load_workbook(temp_file_path, data_only=True)
+                content_parts = []
+                
+                for sheet_name in workbook.sheetnames:
+                    sheet = workbook[sheet_name]
+                    content_parts.append(f"## Sheet: {sheet_name}\n")
+                    
+                    for row in sheet.iter_rows(values_only=True):
+                        row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
+                        if row_text.strip():
+                            content_parts.append(row_text)
+                    content_parts.append("\n")
+                
+                return "\n".join(content_parts)
+            finally:
+                os.unlink(temp_file_path)
+                
+        except Exception as e:
+            print(f"Error extracting Excel content: {e}")
+            return ""
+    
+    def redact_content(self, file_path: str, replacements: Dict[str, str]) -> str:
+        """Redact Excel content across all sheets"""
+        if not replacements:
+            return file_path
+        
+        try:
+            # Download original file
+            file_response = w.files.download(file_path=file_path)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_file:
+                if hasattr(file_response, 'content'):
+                    temp_file.write(file_response.content)
+                elif hasattr(file_response, 'read'):
+                    temp_file.write(file_response.read())
+                else:
+                    temp_file.write(file_response)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Load and process workbook
+                workbook = openpyxl.load_workbook(temp_file_path)
+                
+                for sheet_name in workbook.sheetnames:
+                    sheet = workbook[sheet_name]
+                    
+                    for row in sheet.iter_rows():
+                        for cell in row:
+                            if cell.value and isinstance(cell.value, str):
+                                original_value = cell.value
+                                for search_text, replace_text in replacements.items():
+                                    cell.value = re.sub(re.escape(search_text), replace_text, cell.value, flags=re.IGNORECASE)
+                
+                # Save redacted file
+                redacted_path = generate_output_filename(file_path, "redacted", ".xlsx")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as output_temp:
+                    workbook.save(output_temp.name)
+                    
+                    with open(output_temp.name, 'rb') as f:
+                        w.files.upload(
+                            file_path=redacted_path,
+                            contents=f,
+                            overwrite=True
+                        )
+                    os.unlink(output_temp.name)
+                
+                return redacted_path
+            finally:
+                os.unlink(temp_file_path)
+                
+        except Exception as e:
+            print(f"Error redacting Excel content: {e}")
+            raise e
+    
+    def get_supported_extensions(self) -> List[str]:
+        return ['.xlsx', '.xls']
+
+# PowerPoint handler implementation  
+class PowerPointHandler(BaseFormatHandler):
+    def can_handle(self, file_path: str, mime_type: str = None) -> bool:
+        return (file_path.lower().endswith(('.pptx', '.ppt')) or 
+                mime_type == 'application/vnd.openxmlformats-officedocument.presentationml.presentation') and POWERPOINT_SUPPORT
+    
+    def extract_content(self, file_path: str) -> str:
+        """Extract text content from PowerPoint slides"""
+        if not w:
+            raise Exception("Databricks connection not configured")
+        
+        try:
+            # Download file from UC Volume
+            file_response = w.files.download(file_path=file_path)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as temp_file:
+                if hasattr(file_response, 'content'):
+                    temp_file.write(file_response.content)
+                elif hasattr(file_response, 'read'):
+                    temp_file.write(file_response.read())
+                else:
+                    temp_file.write(file_response)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Read PowerPoint file
+                presentation = Presentation(temp_file_path)
+                content_parts = []
+                
+                for i, slide in enumerate(presentation.slides):
+                    content_parts.append(f"## Slide {i+1}\n")
+                    
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text:
+                            content_parts.append(shape.text)
+                    content_parts.append("\n")
+                
+                return "\n".join(content_parts)
+            finally:
+                os.unlink(temp_file_path)
+                
+        except Exception as e:
+            print(f"Error extracting PowerPoint content: {e}")
+            return ""
+    
+    def redact_content(self, file_path: str, replacements: Dict[str, str]) -> str:
+        """Redact PowerPoint content across all slides"""
+        if not replacements:
+            return file_path
+        
+        try:
+            # Download original file
+            file_response = w.files.download(file_path=file_path)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as temp_file:
+                if hasattr(file_response, 'content'):
+                    temp_file.write(file_response.content)
+                elif hasattr(file_response, 'read'):
+                    temp_file.write(file_response.read())
+                else:
+                    temp_file.write(file_response)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Load and process presentation
+                presentation = Presentation(temp_file_path)
+                
+                for slide in presentation.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text:
+                            original_text = shape.text
+                            for search_text, replace_text in replacements.items():
+                                shape.text = re.sub(re.escape(search_text), replace_text, shape.text, flags=re.IGNORECASE)
+                
+                # Save redacted file
+                redacted_path = generate_output_filename(file_path, "redacted", ".pptx")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as output_temp:
+                    presentation.save(output_temp.name)
+                    
+                    with open(output_temp.name, 'rb') as f:
+                        w.files.upload(
+                            file_path=redacted_path,
+                            contents=f,
+                            overwrite=True
+                        )
+                    os.unlink(output_temp.name)
+                
+                return redacted_path
+            finally:
+                os.unlink(temp_file_path)
+                
+        except Exception as e:
+            print(f"Error redacting PowerPoint content: {e}")
+            raise e
+    
+    def get_supported_extensions(self) -> List[str]:
+        return ['.pptx', '.ppt']
+
+# Format handler registry
+FORMAT_HANDLERS = {
+    'markdown': MarkdownHandler(),
+    'excel': ExcelHandler(),
+    'powerpoint': PowerPointHandler()
+}
+
+def get_format_handler(format_type: str) -> Optional[BaseFormatHandler]:
+    """Get appropriate format handler"""
+    return FORMAT_HANDLERS.get(format_type)
+
+# Base exporter class
+class BaseExporter(ABC):
+    @abstractmethod
+    def export(self, content: str, metadata: Dict[str, Any]) -> str:
+        """Export content to specific format, return file path"""
+        pass
+    
+    @abstractmethod
+    def get_mime_type(self) -> str:
+        """Return MIME type for exported format"""
+        pass
+
+# Markdown exporter implementation
+class MarkdownExporter(BaseExporter):
+    def export(self, content: str, metadata: Dict[str, Any]) -> str:
+        """Export content as Markdown file"""
+        try:
+            # Format content as proper Markdown
+            output_content = f"# Exported Document\n\n"
+            
+            if metadata.get("files"):
+                output_content += f"**Source Files:** {', '.join(metadata['files'])}\n\n"
+            
+            import datetime
+            output_content += f"**Export Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            output_content += "---\n\n"
+            output_content += content
+            
+            # Create temporary file and upload to UC Volume
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_filename = f"exported_document_{timestamp}.md"
+            export_path = f"{get_uc_volume_path().rstrip('/')}/{export_filename}"
+            
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, suffix='.md') as temp_file:
+                temp_file.write(output_content)
+                temp_file_path = temp_file.name
+            
+            try:
+                with open(temp_file_path, 'rb') as f:
+                    w.files.upload(
+                        file_path=export_path,
+                        contents=f,
+                        overwrite=True
+                    )
+            finally:
+                os.unlink(temp_file_path)
+            
+            return export_path
+        except Exception as e:
+            print(f"Error exporting to Markdown: {e}")
+            raise e
+    
+    def get_mime_type(self) -> str:
+        return 'text/markdown'
+
+# Excel exporter implementation
+class ExcelExporter(BaseExporter):
+    def export(self, content: str, metadata: Dict[str, Any]) -> str:
+        """Export content as Excel workbook"""
+        if not EXCEL_SUPPORT:
+            raise Exception("Excel support not available")
+        
+        try:
+            # Create workbook
+            workbook = Workbook()
+            
+            # Remove default sheet and create new ones
+            workbook.remove(workbook.active)
+            
+            # Create summary sheet
+            summary_sheet = workbook.create_sheet("Summary")
+            summary_sheet['A1'] = "Exported Document Summary"
+            from openpyxl.styles import Font
+            summary_sheet['A1'].font = Font(bold=True, size=14)
+            
+            if metadata.get("files"):
+                summary_sheet['A3'] = "Source Files:"
+                summary_sheet['A3'].font = Font(bold=True)
+                for i, file_path in enumerate(metadata['files']):
+                    summary_sheet[f'A{4+i}'] = file_path
+            
+            # Create content sheet
+            content_sheet = workbook.create_sheet("Content")
+            content_sheet['A1'] = "Document Content"
+            content_sheet['A1'].font = Font(bold=True, size=14)
+            
+            # Split content into lines and add to sheet
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                content_sheet[f'A{i+3}'] = line
+            
+            # Save and upload
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_filename = f"exported_document_{timestamp}.xlsx"
+            export_path = f"{get_uc_volume_path().rstrip('/')}/{export_filename}"
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_file:
+                workbook.save(temp_file.name)
+                
+                with open(temp_file.name, 'rb') as f:
+                    w.files.upload(
+                        file_path=export_path,
+                        contents=f,
+                        overwrite=True
+                    )
+                os.unlink(temp_file.name)
+            
+            return export_path
+        except Exception as e:
+            print(f"Error exporting to Excel: {e}")
+            raise e
+    
+    def get_mime_type(self) -> str:
+        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+# PowerPoint exporter implementation
+class PowerPointExporter(BaseExporter):
+    def export(self, content: str, metadata: Dict[str, Any]) -> str:
+        """Export content as PowerPoint presentation"""
+        if not POWERPOINT_SUPPORT:
+            raise Exception("PowerPoint support not available")
+        
+        try:
+            # Create presentation
+            presentation = Presentation()
+            
+            # Title slide
+            title_slide_layout = presentation.slide_layouts[0]
+            title_slide = presentation.slides.add_slide(title_slide_layout)
+            title = title_slide.shapes.title
+            subtitle = title_slide.placeholders[1]
+            
+            title.text = "Exported Document"
+            subtitle.text = f"Generated from {len(metadata.get('files', []))} source file(s)"
+            
+            # Content slides - split content into sections
+            lines = content.split('\n')
+            current_slide = None
+            slide_layout = presentation.slide_layouts[1]  # Title and Content layout
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Check if this should be a new slide (starts with ##)
+                if line.startswith('##'):
+                    current_slide = presentation.slides.add_slide(slide_layout)
+                    title_shape = current_slide.shapes.title
+                    title_shape.text = line.replace('##', '').strip()
+                    
+                    # Add content placeholder
+                    content_shape = current_slide.placeholders[1]
+                    content_shape.text = ""
+                elif current_slide is not None:
+                    # Add content to current slide
+                    content_shape = current_slide.placeholders[1]
+                    if content_shape.text:
+                        content_shape.text += f"\n{line}"
+                    else:
+                        content_shape.text = line
+                else:
+                    # Create first content slide if none exists
+                    current_slide = presentation.slides.add_slide(slide_layout)
+                    title_shape = current_slide.shapes.title
+                    title_shape.text = "Document Content"
+                    content_shape = current_slide.placeholders[1]
+                    content_shape.text = line
+            
+            # Save and upload
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_filename = f"exported_document_{timestamp}.pptx"
+            export_path = f"{get_uc_volume_path().rstrip('/')}/{export_filename}"
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as temp_file:
+                presentation.save(temp_file.name)
+                
+                with open(temp_file.name, 'rb') as f:
+                    w.files.upload(
+                        file_path=export_path,
+                        contents=f,
+                        overwrite=True
+                    )
+                os.unlink(temp_file.name)
+            
+            return export_path
+        except Exception as e:
+            print(f"Error exporting to PowerPoint: {e}")
+            raise e
+    
+    def get_mime_type(self) -> str:
+        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+
+# Exporter registry
+EXPORTERS = {
+    'md': MarkdownExporter(),
+    'xlsx': ExcelExporter(),
+    'pptx': PowerPointExporter()
+}
+
+def get_exporter(export_format: str) -> Optional[BaseExporter]:
+    """Get appropriate exporter"""
+    return EXPORTERS.get(export_format)
+
 class WarehouseConfigRequest(BaseModel):
     warehouse_id: str
 
@@ -102,6 +701,22 @@ class ParseDocumentRequest(BaseModel):
 
 class RedactPDFRequest(BaseModel):
     file_paths: List[str]
+
+# New Pydantic models for multi-format support
+class ExportRequest(BaseModel):
+    file_paths: List[str]
+    export_format: str  # 'md', 'xlsx', 'pptx'
+    output_filename: Optional[str] = None
+
+class RedactDocumentRequest(BaseModel):
+    file_paths: List[str]
+    file_types: List[str] = []  # Support multiple formats
+
+class FileFormatInfo(BaseModel):
+    supported_formats: List[str]
+    upload_formats: List[str]
+    export_formats: List[str]
+    format_handlers_available: Dict[str, bool]
 
 
 @app.get("/api/warehouse-config")
@@ -169,7 +784,7 @@ def update_delta_table_path_config(request: DeltaTablePathConfigRequest):
 
 @app.post("/api/upload-to-uc")
 async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
-    """Upload files to Databricks UC Volume"""
+    """Upload files to Databricks UC Volume - supports multiple formats"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
     
@@ -177,6 +792,13 @@ async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
         uploaded_files = []
         
         for file in files:
+            # Validate file format
+            file_ext = get_file_extension(file.filename)
+            if file_ext not in SUPPORTED_UPLOAD_FORMATS:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Unsupported file format: {file_ext}. Supported formats: {', '.join(SUPPORTED_UPLOAD_FORMATS)}"
+                )
             # Create a temporary file to store the uploaded content
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                 # Copy file content to temporary file
@@ -199,10 +821,18 @@ async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
                 # Get file size for response
                 file_size = os.path.getsize(temp_file_path)
                 
+                # Detect format and handler availability
+                file_format = detect_file_format(file.filename)
+                handler_available = get_format_handler(file_format) is not None or file_format == 'pdf'
+                
                 uploaded_files.append({
                     "name": file.filename,
                     "path": uc_file_path,
-                    "size": file_size
+                    "size": file_size,
+                    "format": file_format,
+                    "extension": file_ext,
+                    "handler_available": handler_available,
+                    "redaction_supported": handler_available
                 })
                 
             finally:
@@ -1037,6 +1667,324 @@ def redact_pdf_documents(request: RedactPDFRequest):
     except Exception as e:
         print(f"PDF redaction error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to redact PDF files: {str(e)}")
+
+# New endpoints for multi-format support
+
+@app.get("/api/supported-formats")
+def get_supported_formats():
+    """Get list of supported file formats for upload and export"""
+    return FileFormatInfo(
+        supported_formats=SUPPORTED_UPLOAD_FORMATS,
+        upload_formats=SUPPORTED_UPLOAD_FORMATS,
+        export_formats=SUPPORTED_EXPORT_FORMATS,
+        format_handlers_available={
+            'markdown': MARKDOWN_SUPPORT,
+            'excel': EXCEL_SUPPORT, 
+            'powerpoint': POWERPOINT_SUPPORT,
+            'pdf': True  # Always available
+        }
+    )
+
+@app.post("/api/export-document")
+def export_document(request: ExportRequest):
+    """Export processed document data to specified format"""
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    
+    if request.export_format not in EXPORTERS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported export format: {request.export_format}. Supported: {list(EXPORTERS.keys())}"
+        )
+    
+    try:
+        destination_table = get_delta_table_path()
+        
+        # Get document content from Delta table
+        if request.file_paths:
+            dbfs_paths = [('dbfs:' + fp if fp.startswith('/Volumes/') else fp) for fp in request.file_paths]
+            path_conditions = ", ".join([f"'{fp}'" for fp in dbfs_paths])
+            where_clause = f"WHERE path IN ({path_conditions})"
+        else:
+            where_clause = ""
+        
+        query = f"""
+        SELECT path, content
+        FROM IDENTIFIER('{destination_table}')
+        {where_clause}
+        """
+        
+        result = w.statement_execution.execute_statement(
+            statement=query,
+            warehouse_id=current_warehouse_id,
+            wait_timeout='30s'
+        )
+        
+        if not result.result or not result.result.data_array:
+            raise HTTPException(status_code=404, detail="No document data found")
+        
+        # Combine content from all documents
+        combined_content = ""
+        metadata = {"files": [], "export_format": request.export_format}
+        
+        for row in result.result.data_array:
+            path, content = row[0], row[1]
+            combined_content += f"\n\n{content}" if combined_content else content
+            metadata["files"].append(path)
+        
+        # Export using appropriate exporter
+        exporter = EXPORTERS[request.export_format]
+        export_file_path = exporter.export(combined_content, metadata)
+        
+        # Generate download filename
+        output_filename = request.output_filename or f"exported_document.{request.export_format}"
+        
+        return {
+            "success": True,
+            "export_file_path": export_file_path,
+            "download_filename": output_filename,
+            "export_format": request.export_format,
+            "files_processed": len(metadata["files"])
+        }
+        
+    except Exception as e:
+        print(f"Export error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to export document: {str(e)}")
+
+@app.post("/api/redact-document")
+def redact_documents(request: RedactDocumentRequest):
+    """Perform NER-based redaction on uploaded documents across formats"""
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+    
+    if not request.file_paths:
+        raise HTTPException(status_code=400, detail="file_paths is required")
+    
+    try:
+        destination_table = get_delta_table_path()
+        redacted_files = []
+        
+        for original_file_path in request.file_paths:
+            print(f"Processing redaction for: {original_file_path}")
+            
+            # Detect file format
+            file_format = detect_file_format(original_file_path)
+            handler = get_format_handler(file_format)
+            
+            # Fall back to PDF handler for PDF files
+            if not handler and file_format == 'pdf':
+                # Use existing PDF redaction logic
+                if not original_file_path.lower().endswith('.pdf'):
+                    print(f"Skipping non-PDF file: {original_file_path}")
+                    continue
+                
+                # Convert to dbfs format for querying
+                dbfs_path = 'dbfs:' + original_file_path if original_file_path.startswith('/Volumes/') else original_file_path
+                
+                # Get document content from Delta table
+                query = f"""
+                SELECT content
+                FROM IDENTIFIER('{destination_table}')
+                WHERE path = '{dbfs_path}'
+                LIMIT 1
+                """
+                
+                result = w.statement_execution.execute_statement(
+                    statement=query,
+                    warehouse_id=current_warehouse_id,
+                    wait_timeout='30s'
+                )
+                
+                if not result.result or not result.result.data_array:
+                    continue
+                
+                content = result.result.data_array[0][0]
+                if not content or not content.strip():
+                    continue
+                
+                # Extract entities for redaction using NER
+                entities_to_redact = extract_entities_for_redaction(content)
+                
+                if not entities_to_redact:
+                    redacted_files.append({
+                        "original_file": original_file_path,
+                        "redacted_file": original_file_path,
+                        "entities_count": 0,
+                        "status": "no_entities_found",
+                        "format": file_format
+                    })
+                    continue
+                
+                # Perform PDF redaction using existing function
+                redacted_path = redact_pdf_from_uc(original_file_path, entities_to_redact)
+                
+                redacted_files.append({
+                    "original_file": original_file_path,
+                    "redacted_file": redacted_path,
+                    "entities_count": len(entities_to_redact),
+                    "entities": entities_to_redact,
+                    "status": "redacted",
+                    "format": file_format
+                })
+                continue
+            
+            if not handler:
+                print(f"No handler available for format: {file_format} ({original_file_path})")
+                redacted_files.append({
+                    "original_file": original_file_path,
+                    "redacted_file": original_file_path,
+                    "entities_count": 0,
+                    "status": "format_not_supported",
+                    "format": file_format
+                })
+                continue
+            
+            # Get document content from Delta table
+            dbfs_path = 'dbfs:' + original_file_path if original_file_path.startswith('/Volumes/') else original_file_path
+            
+            query = f"""
+            SELECT content
+            FROM IDENTIFIER('{destination_table}')
+            WHERE path = '{dbfs_path}'
+            LIMIT 1
+            """
+            
+            result = w.statement_execution.execute_statement(
+                statement=query,
+                warehouse_id=current_warehouse_id,
+                wait_timeout='30s'
+            )
+            
+            if not result.result or not result.result.data_array:
+                continue
+            
+            content = result.result.data_array[0][0]
+            if not content or not content.strip():
+                continue
+            
+            # Extract entities for redaction using NER
+            entities_to_redact = extract_entities_for_redaction(content)
+            
+            if not entities_to_redact:
+                redacted_files.append({
+                    "original_file": original_file_path,
+                    "redacted_file": original_file_path,
+                    "entities_count": 0,
+                    "status": "no_entities_found",
+                    "format": file_format
+                })
+                continue
+            
+            # Perform format-specific redaction
+            redacted_path = handler.redact_content(original_file_path, entities_to_redact)
+            
+            redacted_files.append({
+                "original_file": original_file_path,
+                "redacted_file": redacted_path,
+                "entities_count": len(entities_to_redact),
+                "entities": entities_to_redact,
+                "status": "redacted",
+                "format": file_format
+            })
+        
+        return {
+            "success": True,
+            "message": f"Successfully processed {len(redacted_files)} file(s) for redaction",
+            "redacted_files": redacted_files
+        }
+        
+    except Exception as e:
+        print(f"Document redaction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to redact documents: {str(e)}")
+
+@app.get("/api/download-exported/{filename}")
+def download_exported_file(filename: str):
+    """Download exported file by filename"""
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename parameter is required")
+    
+    # Construct full file path
+    file_path = f"{get_uc_volume_path().rstrip('/')}/{filename}"
+    
+    try:
+        print(f"Downloading exported file: {file_path}")
+        
+        # Download the file from UC Volume
+        file_response = w.files.download(file_path=file_path)
+        
+        # Determine file extension and MIME type
+        file_ext = get_file_extension(filename)
+        mime_type = get_mime_type(file_ext)
+        
+        # Create a temporary file to store the downloaded content
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+            temp_file_path = temp_file.name
+            
+            # Handle different response types from Databricks SDK
+            response_type = type(file_response).__name__
+            print(f"Download response type: {response_type}")
+            
+            try:
+                if hasattr(file_response, 'iter_content') and callable(getattr(file_response, 'iter_content')):
+                    for chunk in file_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            temp_file.write(chunk)
+                elif hasattr(file_response, 'content'):
+                    content_data = getattr(file_response, 'content')
+                    if isinstance(content_data, bytes):
+                        temp_file.write(content_data)
+                    else:
+                        raise Exception(f"Content is not bytes: {type(content_data)}")
+                elif hasattr(file_response, 'read') and callable(getattr(file_response, 'read')):
+                    content_data = file_response.read()
+                    if isinstance(content_data, bytes):
+                        temp_file.write(content_data)
+                    else:
+                        temp_file.write(content_data.encode() if isinstance(content_data, str) else content_data)
+                elif isinstance(file_response, bytes):
+                    temp_file.write(file_response)
+                else:
+                    raise Exception(f"Unsupported download response type: {response_type}")
+                    
+            except Exception as e:
+                print(f"Error writing to temp file: {e}")
+                os.unlink(temp_file_path)
+                raise Exception(f"Failed to process download response: {str(e)}")
+        
+        # Check if temp file has content
+        file_size = os.path.getsize(temp_file_path)
+        print(f"Temp file size: {file_size} bytes")
+        
+        if file_size == 0:
+            os.unlink(temp_file_path)
+            raise HTTPException(status_code=404, detail="Exported file not found or empty")
+        
+        # Return the file as a download using FileResponse
+        def cleanup_temp_file():
+            try:
+                os.unlink(temp_file_path)
+                print(f"Cleaned up temp file: {temp_file_path}")
+            except:
+                pass
+        
+        response = FileResponse(
+            path=temp_file_path,
+            media_type=mime_type,
+            filename=filename
+        )
+        
+        atexit.register(cleanup_temp_file)
+        return response
+        
+    except Exception as e:
+        print(f"Exported file download error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to download exported file: {str(e)}")
 
 # Mount static files for Next.js assets (_next directory, favicon, etc.)
 import os
