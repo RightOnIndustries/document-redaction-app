@@ -7,7 +7,7 @@ A full-stack application demonstrating AI Functions for document redaction, buil
 - **Document Upload**: Upload PDFs to Unity Catalog volumes
 - **AI-Powered Parsing**: Extract tables from documents using Databricks AI Functions: `ai_parse_document()`
 - **Data Storage**: Store processed data in Delta tables
-- **PDF Redaction**: Perform name entity redaction using AI_function
+- **PDF Document Redaction**: Perform name entity redaction using AI Query and redaction using pymupdf
 - **PDF Export**: Generate Excel files from extracted table data
 
 ## Architecture
